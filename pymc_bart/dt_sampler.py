@@ -1,7 +1,7 @@
 
 import numpy as np
 from typing import List, Tuple
-from decision_table import DecisionTable
+from .decision_table import DecisionTable
 
 def sse_loss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sum((y_true - y_pred) ** 2))
