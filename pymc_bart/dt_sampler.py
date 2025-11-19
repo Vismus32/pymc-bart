@@ -1,109 +1,132 @@
-
+# pymc_bart/dt_sampler.py
+# Minimal MH-style sampler for symmetric binary trees (CatBoost-style) with MH moves: grow, prune, change
 import numpy as np
-from typing import List, Tuple
-from .decision_table import DecisionTable
+from typing import Tuple
+from .decision_table import DecisionTable  # переименуй в SymmetricTree, если хочешь
 
 def sse_loss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
     return float(np.sum((y_true - y_pred) ** 2))
 
-class EnsembleDTMetropolis:
+
+class SimpleSymmetricTreeMetropolis:
     """
-    Metropolis-Hastings sampler for an ensemble of DecisionTables (BART-style).
+    Metropolis-Hastings sampler for one symmetric binary tree.
+    Moves:
+      - GROW: add a new level
+      - PRUNE: remove last level
+      - CHANGE: change feature or threshold at a random level
+    Leaf values are drawn conditioned on residuals.
     """
-    def __init__(self, trees: List[DecisionTable], X: np.ndarray, y: np.ndarray, sigma: float = 1.0, rng: int = None):
-        self.trees = trees
+
+    def __init__(self, tree: DecisionTable, X: np.ndarray, y: np.ndarray, sigma: float = 1.0, rng: int = None):
+        self.tree = tree
         self.X = np.asarray(X)
         self.y = np.asarray(y).reshape(-1)
         self.sigma = float(sigma)
         if rng is not None:
             np.random.seed(rng)
-        self.n_trees = len(trees)
 
     def current_prediction(self) -> np.ndarray:
-        # Сумма предсказаний всех деревьев
-        pred = np.zeros_like(self.y, dtype=float)
-        for tree in self.trees:
-            pred += tree.predict(self.X)
-        return pred
+        return self.tree.predict(self.X).reshape(-1)
 
     def log_likelihood(self, pred: np.ndarray) -> float:
         resid = self.y - pred
         return -0.5 * np.sum((resid / self.sigma) ** 2)
 
-    def propose_tree(self, k: int) -> Tuple[DecisionTable, np.ndarray]:
-        """
-        Propose a new version of tree k, draw leaf values using residuals
-        """
-        tree = self.trees[k]
-        prop = tree.copy()
+    # --- MH moves ---
+    def _grow(self):
+        """Add new level to the tree"""
+        n_features = self.X.shape[1]
+        new_var = np.random.randint(0, n_features)
+        col = self.X[:, new_var]
+        uniq = np.unique(col)
+        if len(uniq) == 1:
+            new_val = float(uniq[0])
+        else:
+            a, b = np.random.choice(uniq, size=2, replace=False)
+            new_val = float((a + b) / 2.0)
+        self.tree.split_vars.append(new_var)
+        self.tree.split_vals.append(new_val)
+        self.tree.depth += 1
+        # update leaf values: 2^depth leaves
+        n_leaves = 2 ** self.tree.depth
+        self.tree.leaf_values = np.zeros(n_leaves)
 
-        # Случайный сплит proposal (можно использовать ту же логику, что и SimpleDTMetropolis)
-        d = np.random.randint(0, prop.depth)
-        n_features = prop.n_features
+    def _prune(self):
+        """Remove last level from the tree"""
+        if self.tree.depth <= 1:
+            return  # cannot prune below depth 1
+        self.tree.split_vars.pop()
+        self.tree.split_vals.pop()
+        self.tree.depth -= 1
+        # update leaf values
+        n_leaves = 2 ** self.tree.depth
+        self.tree.leaf_values = np.zeros(n_leaves)
+
+    def _change(self):
+        """Change feature or threshold at a random level"""
+        depth = self.tree.depth
+        n_features = self.X.shape[1]
+        d = np.random.randint(0, depth)
         if np.random.rand() < 0.5:
-            # смена переменной
+            # change variable
             new_var = np.random.randint(0, n_features)
-            prop.split_vars[d] = int(new_var)
+            self.tree.split_vars[d] = new_var
             col = self.X[:, new_var]
             uniq = np.unique(col)
             if len(uniq) == 1:
-                prop.split_vals[d] = float(uniq[0])
+                self.tree.split_vals[d] = float(uniq[0])
             else:
                 a, b = np.random.choice(uniq, size=2, replace=False)
-                prop.split_vals[d] = float((a + b)/2)
+                self.tree.split_vals[d] = float((a + b) / 2.0)
         else:
-            # смена порога
-            sv = prop.split_vars[d]
-            if sv < 0:
-                new_var = np.random.randint(0, n_features)
-                prop.split_vars[d] = int(new_var)
-                col = self.X[:, new_var]
-                uniq = np.unique(col)
-                prop.split_vals[d] = float(uniq[np.random.randint(0, len(uniq))])
+            # change threshold
+            var = self.tree.split_vars[d]
+            col = self.X[:, var]
+            uniq = np.unique(col)
+            if len(uniq) == 1:
+                self.tree.split_vals[d] = float(uniq[0])
             else:
-                col = self.X[:, sv]
-                uniq = np.unique(col)
-                if len(uniq) == 1:
-                    prop.split_vals[d] = float(uniq[0])
-                else:
-                    a, b = np.random.choice(uniq, size=2, replace=False)
-                    prop.split_vals[d] = float((a + b)/2)
+                a, b = np.random.choice(uniq, size=2, replace=False)
+                self.tree.split_vals[d] = float((a + b) / 2.0)
 
-        # residuals = y - sum(other_trees)
-        pred_other = np.zeros_like(self.y)
-        for i, t in enumerate(self.trees):
-            if i != k:
-                pred_other += t.predict(self.X)
-        residuals = self.y - pred_other
-
-        # draw leaf values
+# --- Propose a new tree ---
+    def propose(self) -> Tuple[DecisionTable, np.ndarray]:
+        prop = self.tree.copy()
+        move = np.random.choice(['grow', 'prune', 'change'])
+        if move == 'grow':
+            prop_grow = SimpleSymmetricTreeMetropolis(prop, self.X, self.y, self.sigma)
+            prop_grow._grow()
+        elif move == 'prune':
+            prop_prune = SimpleSymmetricTreeMetropolis(prop, self.X, self.y, self.sigma)
+            prop_prune._prune()
+        else:
+            prop_change = SimpleSymmetricTreeMetropolis(prop, self.X, self.y, self.sigma)
+            prop_change._change()
+        # draw leaf values from residuals (single-tree)
+        residuals = self.y
         prop.draw_leaf_values_from_residuals(residuals, self.X, sigma=self.sigma)
-
-        prop_pred = prop.predict(self.X)
-        return prop, prop_pred
+        pred = prop.predict(self.X).reshape(-1)
+        return prop, pred
 
     def step(self) -> bool:
-        """
-        Do one MH step: pick a tree at random, propose, accept/reject.
-        Returns True if accepted
-        """
-        k = np.random.randint(0, self.n_trees)
         cur_pred = self.current_prediction()
         cur_ll = self.log_likelihood(cur_pred)
-
-        prop, prop_pred = self.propose_tree(k)
+        prop, prop_pred = self.propose()
         prop_ll = self.log_likelihood(prop_pred)
-
         log_alpha = prop_ll - cur_ll
         if np.log(np.random.rand()) < log_alpha:
             # accept
-            self.trees[k].split_vars = prop.split_vars
-            self.trees[k].split_vals = prop.split_vals
-            self.trees[k].leaf_values = prop.leaf_values
-            self.trees[k].recompute_output_from_assignments(self.X)
+            self.tree.split_vars = prop.split_vars
+            self.tree.split_vals = prop.split_vals
+            self.tree.leaf_values = prop.leaf_values
+            self.tree.recompute_output_from_assignments(self.X)
             return True
         return False
-def run(self, n_iter: int = 100, verbose: bool = False) -> dict:
+
+    def run(self, n_iter: int = 100, verbose: bool = False) -> dict:
         accepts = 0
         history = {"ll": [], "accepted": []}
         for i in range(n_iter):
