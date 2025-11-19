@@ -1,151 +1,281 @@
-# pymc_bart/decision_table.py
-# Standalone DecisionTable prototype (no external deps besides numpy)
-from __future__ import annotations
-from typing import List, Optional, Any
+"""Decision Table (symmetric tree) implementation for CatBoost-style trees."""
+
 import numpy as np
+import numpy.typing as npt
+from pytensor import config
+
+from .split_rules import SplitRule
 
 
-class SimpleSplitRule:
+class DecisionTableNode:
+    """Node in a Decision Table (symmetric tree).
+    
+    Attributes
+    ----------
+    value : npt.NDArray
+        Leaf node value or split value
+    idx_split_variable : int
+        Index of the split variable (-1 for leaf nodes)
+    children : dict[int, DecisionTableNode]
+        Child nodes indexed by split outcome
+    nvalue : int
+        Number of data points in this node
+    linear_params : Optional[list[npt.NDArray]]
+        Linear regression parameters for leaf nodes
     """
-    Minimal split-rule for continuous variables.
-    divide(col_values, split_val) -> boolean mask: True = go left, False = go right
-    """
-    def divide(self, col_values: np.ndarray, split_val: Any) -> np.ndarray:
-        # split_val is a scalar threshold -> left if <= threshold
-        return col_values <= split_val
+
+    __slots__ = ("value", "idx_split_variable", "children", "nvalue", "linear_params")
+
+    def __init__(
+        self,
+        value: npt.NDArray = np.array([-1.0]),
+        idx_split_variable: int = -1,
+        children: dict | None = None,
+        nvalue: int = 0,
+        linear_params: list[npt.NDArray] | None = None,
+    ) -> None:
+        self.value = value
+        self.idx_split_variable = idx_split_variable
+        self.children = children or {}
+        self.nvalue = nvalue
+        self.linear_params = linear_params
+
+    def is_leaf_node(self) -> bool:
+        return self.idx_split_variable < 0
+
+    def is_split_node(self) -> bool:
+        return not self.is_leaf_node()
 
 
 class DecisionTable:
+    """Decision Table (symmetric tree) - CatBoost style symmetric tree.
+    
+    A Decision Table is a tree where all nodes at the same depth use the same split variable.
+    This creates a more interpretable structure compared to standard binary trees.
+    
+    Attributes
+    ----------
+    root : DecisionTableNode
+        Root node of the decision table
+    split_rules : list[SplitRule]
+        Split rules for each variable
+    depth : int
+        Maximum depth of the table
+    output : npt.NDArray
+        Predictions array
     """
-    Balanced binary tree where every depth uses a single split predicate (variable + threshold).
-    Leaves = 2**depth. Vectorized predict.
-    Minimal, numpy-only implementation for quick testing.
-    """
+
+    __slots__ = ("root", "split_rules", "depth", "output", "level_variables")
+
     def __init__(
         self,
-        depth: int,
-        n_features: int,
-        shape: int = 1,
-        split_rules: Optional[List[Any]] = None,
-    ):
-        self.depth = int(depth)
-        self.n_features = int(n_features)
-        self.shape = int(shape)
-        self.n_leaves = 2 ** self.depth
-        # For each depth: index of variable to split on (-1 means uninitialized)
-        self.split_vars: List[int] = [-1] * self.depth
-        # For each depth: split value (threshold) or None
-        self.split_vals: List[Optional[Any]] = [None] * self.depth
-        # leaf values: shape (n_leaves, shape)
-        self.leaf_values = np.zeros((self.n_leaves, self.shape), dtype=float)
-        # small record of counts per leaf (not required)
-        self.leaf_n = np.zeros(self.n_leaves, dtype=int)
-        # split rules per variable (default: SimpleSplitRule for all)
-        if split_rules is None:
-            self.split_rules = [SimpleSplitRule() for _ in range(self.n_features)]
-        else:
-            self.split_rules = split_rules
+        root: DecisionTableNode,
+        split_rules: list[SplitRule],
+        output: npt.NDArray,
+        level_variables: list[int] | None = None,
+    ) -> None:
+        self.root = root
+        self.split_rules = split_rules
+        self.output = output
+        self.level_variables = level_variables or []
+        self.depth = self._compute_depth()
 
     @classmethod
-    def new_table(cls, depth: int, n_features: int, shape: int = 1):
-        return cls(depth=depth, n_features=n_features, shape=shape)
+    def new_decision_table(
+        cls,
+        leaf_node_value: npt.NDArray,
+        num_observations: int,
+        shape: int,
+        split_rules: list[SplitRule],
+    ) -> "DecisionTable":
+        """Create a new Decision Table with a single leaf node."""
+        return cls(
+            root=DecisionTableNode(
+                value=leaf_node_value,
+                idx_split_variable=-1,
+                nvalue=num_observations,
+            ),
+            split_rules=split_rules,
+            output=np.zeros((num_observations, shape)).astype(config.floatX),
+            level_variables=[],
+        )
+
+    def _compute_depth(self) -> int:
+        """Compute the depth of the decision table."""
+        def _depth_recursive(node: DecisionTableNode) -> int:
+            if node.is_leaf_node():
+                return 0
+            return 1 + max(_depth_recursive(child) for child in node.children.values())
+
+        return _depth_recursive(self.root)
+
+    def is_symmetric(self) -> bool:
+        """Check if the tree is symmetric (all nodes at same depth use same split variable)."""
+        def _check_symmetry_recursive(node: DecisionTableNode, expected_var: int | None = None) -> tuple[bool, int | None]:
+            if node.is_leaf_node():
+                return True, expected_var
+
+            split_var = node.idx_split_variable
+
+            if expected_var is not None and split_var != expected_var:
+                return False, expected_var
+
+            for child in node.children.values():
+                is_sym, next_var = _check_symmetry_recursive(child, split_var)
+                if not is_sym:
+                    return False, next_var
+
+            return True, split_var
+
+        is_sym, _ = _check_symmetry_recursive(self.root)
+        return is_sym
+
+    def grow_leaf_node(
+        self,
+        leaf_node: DecisionTableNode,
+        selected_predictor: int,
+        split_value: npt.NDArray,
+        left_value: npt.NDArray,
+        right_value: npt.NDArray,
+        left_nvalue: int,
+        right_nvalue: int,
+    ) -> None:
+        """Grow a leaf node by creating two child nodes."""
+        leaf_node.idx_split_variable = selected_predictor
+        leaf_node.value = split_value
+
+        leaf_node.children[0] = DecisionTableNode(
+            value=left_value,
+            idx_split_variable=-1,
+            nvalue=left_nvalue,
+        )
+        leaf_node.children[1] = DecisionTableNode(
+            value=right_value,
+            idx_split_variable=-1,
+            nvalue=right_nvalue,
+        )
+
+    def predict(
+        self,
+        X: npt.NDArray,
+        excluded: list[int] | None = None,
+        shape: int = 1,
+    ) -> npt.NDArray:
+        """
+        Predict output for given input data.
+        
+        Parameters
+        ----------
+        X : npt.NDArray
+            Input data
+        excluded : Optional[list[int]]
+            Variables to exclude from prediction
+        shape : int
+            Output shape
+            
+        Returns
+        -------
+        npt.NDArray
+            Predictions
+        """
+        if excluded is None:
+            excluded = []
+
+        x_shape = (1,) if len(X.shape) == 1 else X.shape[:-1]
+        nd_dims = (...,) + (None,) * len(x_shape)
+
+        p_d = (
+            np.zeros(shape + x_shape) if isinstance(shape, tuple) else np.zeros((shape,) + x_shape)
+        )
+
+        # Traverse the decision table
+        def _traverse(node: DecisionTableNode, weights: npt.NDArray, split_var_parent: int = -1):
+            if node.is_leaf_node():
+                params = node.linear_params
+                if params is None:
+                    p_d_leaf = weights * node.value[nd_dims]
+                else:
+                    p_d_leaf = weights * (
+                        params[0][nd_dims] + params[1][nd_dims] * X[..., split_var_parent]
+                    )
+                return p_d_leaf
+            else:
+                split_var = node.idx_split_variable
+                result = np.zeros_like(p_d)
+
+                if excluded is not None and split_var in excluded:
+                    # Average over both branches
+                    for child_idx, child in node.children.items():
+                        prop = child.nvalue / node.nvalue
+                        result += _traverse(child, weights * prop, split_var)
+                else:
+                    # Split based on split rule
+                    to_left = (
+                        self.split_rules[split_var]
+                        .divide(X[..., split_var], node.value)
+                        .astype("float")
+                    )
+                    
+                    if 0 in node.children:
+                        result += _traverse(node.children[0], weights * to_left, split_var)
+                    if 1 in node.children:
+                        result += _traverse(node.children[1], weights * (1 - to_left), split_var)
+
+                return result
+
+        p_d = _traverse(self.root, np.ones(x_shape), -1)
+
+        if len(X.shape) == 1:
+            p_d = p_d[..., 0]
+
+        return p_d
+
+    def get_leaf_nodes(self) -> list[DecisionTableNode]:
+        """Get all leaf nodes in the decision table."""
+        leaf_nodes = []
+
+        def _collect_leaves(node: DecisionTableNode):
+            if node.is_leaf_node():
+                leaf_nodes.append(node)
+            else:
+                for child in node.children.values():
+                    _collect_leaves(child)
+
+        _collect_leaves(self.root)
+        return leaf_nodes
 
     def copy(self) -> "DecisionTable":
-        dt = DecisionTable(self.depth, self.n_features, self.shape, self.split_rules)
-        dt.split_vars = self.split_vars.copy()
-        dt.split_vals = [None if v is None else (v if isinstance(v, (int, float)) else v.copy())
-                         for v in self.split_vals]
-        dt.leaf_values = self.leaf_values.copy()
-        dt.leaf_n = self.leaf_n.copy()
-        return dt
+        """Create a deep copy of the decision table."""
+        def _copy_node(node: DecisionTableNode) -> DecisionTableNode:
+            return DecisionTableNode(
+                value=node.value.copy(),
+                idx_split_variable=node.idx_split_variable,
+                children={k: _copy_node(v) for k, v in node.children.items()},
+                nvalue=node.nvalue,
+                linear_params=[p.copy() for p in node.linear_params] if node.linear_params else None,
+            )
 
-    def n_leaves_count(self) -> int:
-        return self.n_leaves
+        return DecisionTable(
+            root=_copy_node(self.root),
+            split_rules=self.split_rules,
+            output=self.output.copy(),
+            level_variables=self.level_variables.copy(),
+        )
 
-    def _path_indices(self, X: np.ndarray) -> np.ndarray:
-        """
-        Compute leaf index (0..2^D-1) for each row in X.
-        We treat left as 0, right as 1, and build bits from top depth->bottom.
-        """
-        X = np.asarray(X)
-        n = X.shape[0]
-        idx = np.zeros(n, dtype=int)
-        # iterate depths
-        for d in range(self.depth):
-            sv = self.split_vars[d]
-            sval = self.split_vals[d]
-            if sv < 0 or sval is None:
-                # treat as all-left
-                to_left = np.ones(n, dtype=bool)
-            else:
-                col = X[:, sv]
-                rule = self.split_rules[sv]
-                to_left = rule.divide(col, sval)
-            bit = 1 << (self.depth - 1 - d)
-            idx = idx + (~to_left).astype(int) * bit
-        return idx
+    def trim(self) -> "DecisionTable":
+        """Create a trimmed copy without data point indices."""
+        def _trim_node(node: DecisionTableNode) -> DecisionTableNode:
+            return DecisionTableNode(
+                value=node.value.copy(),
+                idx_split_variable=node.idx_split_variable,
+                children={k: _trim_node(v) for k, v in node.children.items()},
+                nvalue=node.nvalue,
+                linear_params=[p.copy() for p in node.linear_params] if node.linear_params else None,
+            )
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        X: (n_samples, n_features) or (n_features,) -> returns (n_samples, shape) or (shape,) for single sample
-        """
-        X = np.asarray(X)
-        if X.ndim == 1:
-            X = X.reshape(1, -1)
-        idx = self._path_indices(X)
-        out = self.leaf_values[idx]
-        # update leaf_n counts (optional)
-        # reset and count
-        self.leaf_n[:] = 0
-        unique, counts = np.unique(idx, return_counts=True)
-        self.leaf_n[unique] = counts
-        return out.squeeze()
-
-    def recompute_output_from_assignments(self, X: np.ndarray):
-        """
-        Places are not cached separately; predict updates leaf_n.
-        This helper simply calls predict to refresh leaf_n.
-        """
-        self.predict(X)
-
-    def draw_leaf_values_from_residuals(self, residuals: np.ndarray, X: np.ndarray, sigma: float = 1.0):
-        """
-        Simple conjugate-like draw: for each leaf, compute mean of residuals in the leaf and sample normal around it.
-        residuals: vector (n_obs,) representing (y - predictions_others) that this tree should fit (i.e., target)
-        sigma: observation noise (used to scale variance of draw)
-        """
-        X = np.asarray(X)
-        residuals = np.asarray(residuals).reshape(-1)
-        idx = self._path_indices(X)
-        for leaf in range(self.n_leaves):
-            mask = idx == leaf
-            k = mask.sum()
-            if k == 0:
-                # keep previous value (optionally jitter)
-                continue
-            # posterior mean ~ mean(resid) and variance ~ sigma^2 / k
-            mean = residuals[mask].mean()
-            sd = sigma / np.sqrt(k)
-            draw = np.random.normal(loc=mean, scale=sd)
-            self.leaf_values[leaf] = float(draw)
-        # refresh counts
-        self.recompute_output_from_assignments(X)
-
-    def set_random_splits_from_X(self, X: np.ndarray, seed: Optional[int] = None):
-        """
-        Initialize split_vars and split_vals with random choices from X columns and observed values.
-        """
-        if seed is not None:
-            np.random.seed(seed)
-        X = np.asarray(X)
-        for d in range(self.depth):
-            var = np.random.randint(0, self.n_features)
-            self.split_vars[d] = int(var)
-            # choose random threshold as mid-point between two random values of that column
-            col = X[:, var]
-            a, b = np.random.choice(np.unique(col), size=min(2, len(np.unique(col))), replace=False)
-            self.split_vals[d] = float((a + b) / 2.0) if a != b else float(a)
-
-    def __repr__(self):
-        return f"<DecisionTable depth={self.depth} n_leaves={self.n_leaves}>"
-
+        return DecisionTable(
+            root=_trim_node(self.root),
+            split_rules=self.split_rules,
+            output=np.array([-1]),
+            level_variables=self.level_variables.copy(),
+        )
