@@ -153,12 +153,32 @@ class DecisionTable:
         depth: int,
     ) -> None:
         """Grow a leaf node by creating two child nodes."""
+        # Ensure split_value is properly formed 1D array
+        split_value = np.asarray(split_value, dtype=config.floatX)
+        if split_value.ndim > 1:
+            split_value = split_value.ravel()
+        if split_value.ndim == 0:
+            split_value = np.array([split_value.item()], dtype=config.floatX)
+        
         split_var, split_threshold = self._resolve_level_predicate(
             depth, selected_predictor, split_value
         )
 
         leaf_node.idx_split_variable = split_var
+        # Ensure value is 1D array
+        split_threshold = np.asarray(split_threshold, dtype=config.floatX).ravel()
+        if split_threshold.ndim == 0:
+            split_threshold = np.array([split_threshold.item()], dtype=config.floatX)
         leaf_node.value = split_threshold.copy()
+
+        # Ensure leaf values are 1D arrays
+        left_value = np.asarray(left_value, dtype=config.floatX).ravel()
+        if left_value.ndim == 0:
+            left_value = np.array([left_value.item()], dtype=config.floatX)
+        
+        right_value = np.asarray(right_value, dtype=config.floatX).ravel()
+        if right_value.ndim == 0:
+            right_value = np.array([right_value.item()], dtype=config.floatX)
 
         leaf_node.children[0] = DecisionTableNode(
             value=left_value,
@@ -211,7 +231,11 @@ class DecisionTable:
             if node.is_leaf_node():
                 params = node.linear_params
                 if params is None:
-                    p_d_leaf = weights * node.value[nd_dims]
+                    # Ensure node.value is properly indexed
+                    node_val = np.asarray(node.value, dtype=config.floatX).ravel()
+                    if node_val.size == 0:
+                        node_val = np.array([0.0], dtype=config.floatX)
+                    p_d_leaf = weights * node_val[0]  # Use scalar, not array indexing
                 else:
                     p_d_leaf = weights * (
                         params[0][nd_dims] + params[1][nd_dims] * X[..., split_var_parent]
@@ -227,10 +251,11 @@ class DecisionTable:
                         prop = child.nvalue / node.nvalue
                         result += _traverse(child, weights * prop, split_var)
                 else:
-                    # Split based on split rule
+                    # Split based on split rule - ensure node.value is proper shape
+                    node_val = np.asarray(node.value, dtype=config.floatX).ravel()
                     to_left = (
                         self.split_rules[split_var]
-                        .divide(X[..., split_var], node.value)
+                        .divide(X[..., split_var], node_val)
                         .astype("float")
                     )
                     
@@ -334,8 +359,13 @@ class DecisionTable:
 
     def prune_node(self, node: DecisionTableNode, new_value: npt.NDArray, nvalue: int) -> None:
         """Convert a split node into a leaf node and refresh metadata."""
+        # Ensure new_value is 1D array
+        new_value_normalized = np.asarray(new_value, dtype=config.floatX).ravel()
+        if new_value_normalized.ndim == 0:
+            new_value_normalized = np.array([new_value_normalized.item()], dtype=config.floatX)
+        
         node.idx_split_variable = -1
-        node.value = new_value
+        node.value = new_value_normalized
         node.children = {}
         node.nvalue = nvalue
         self._refresh_metadata()
@@ -416,16 +446,26 @@ class DecisionTable:
         self, depth: int, split_variable: int, split_value: npt.NDArray
     ) -> tuple[int, npt.NDArray]:
         """Ensure predicate consistency at a given depth."""
+        # Normalize split_value to 1D array
+        split_value_normalized = np.asarray(split_value, dtype=config.floatX)
+        if split_value_normalized.ndim > 1:
+            split_value_normalized = split_value_normalized.ravel()
+        if split_value_normalized.ndim == 0:
+            split_value_normalized = np.array([split_value_normalized.item()], dtype=config.floatX)
+        
         if depth < len(self.level_variables):
-            return self.level_variables[depth], self.level_split_values[depth]
+            # Return existing predicate (already stored, should be normalized)
+            stored_val = self.level_split_values[depth]
+            stored_val_normalized = np.asarray(stored_val, dtype=config.floatX).ravel()
+            return self.level_variables[depth], stored_val_normalized
 
         if split_value is None:
             raise ValueError("Split value must be provided for new depth levels.")
 
         self._ensure_level_capacity(depth)
         self.level_variables[depth] = split_variable
-        self.level_split_values[depth] = split_value.copy()
-        return split_variable, split_value
+        self.level_split_values[depth] = split_value_normalized.copy()
+        return split_variable, split_value_normalized
 
     def _ensure_level_capacity(self, depth: int) -> None:
         """Ensure the metadata arrays can store information for the given depth."""

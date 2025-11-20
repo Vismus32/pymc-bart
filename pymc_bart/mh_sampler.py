@@ -104,14 +104,16 @@ class GrowMove(MHDecisionTableMove):
         if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf
 
-        left_value = _draw_leaf_value(Y, leaf_sd, left_mask, rng)
-        right_value = _draw_leaf_value(Y, leaf_sd, right_mask, rng)
+        # Draw leaf values with regularization
+        global_mean = np.mean(Y)
+        left_value = _draw_leaf_value(Y, leaf_sd, left_mask, rng, global_mean)
+        right_value = _draw_leaf_value(Y, leaf_sd, right_mask, rng, global_mean)
 
-        # Grow the leaf
+        # Grow the leaf (split_value already array - no double wrapping!)
         new_table.grow_leaf_node(
             leaf_node=leaf_node,
             selected_predictor=split_var,
-            split_value=np.array([split_value]),
+            split_value=split_value,
             left_value=left_value,
             right_value=right_value,
             left_nvalue=int(left_mask.sum()),
@@ -119,11 +121,14 @@ class GrowMove(MHDecisionTableMove):
             depth=depth,
         )
 
-        # Compute Hastings ratio
-        n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = new_table.count_split_nodes()
+        # Correct Hastings: log(n_leaves_before) - log(n_splits_after)
+        n_leaf_nodes_before = len(leaf_nodes)
+        n_split_nodes_after = new_table.count_split_nodes()
 
-        log_alpha = np.log(max(n_split_nodes, 1)) - np.log(n_leaf_nodes)
+        if n_split_nodes_after == 0:
+            return new_table, -np.inf
+
+        log_alpha = np.log(n_leaf_nodes_before) - np.log(max(n_split_nodes_after, 1))
 
         return new_table, log_alpha
 
@@ -162,8 +167,9 @@ class PruneMove(MHDecisionTableMove):
         if node_mask is None or not node_mask.any():
             return new_table, -np.inf
 
-        # Draw new leaf value
-        new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask, rng)
+        # Draw new leaf value with regularization
+        global_mean = np.mean(Y)
+        new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask, rng, global_mean)
 
         # Prune: convert split node to leaf
         new_table.prune_node(
@@ -172,12 +178,12 @@ class PruneMove(MHDecisionTableMove):
             nvalue=int(node_mask.sum()),
         )
 
-        # Compute Hastings ratio (reverse grow selects among new leaves)
+        # Correct Hastings: log(n_splits_before) - log(n_leaves_after)
         n_leaf_nodes_after = new_table.count_leaf_nodes()
         if n_leaf_nodes_after <= 0 or n_split_nodes_before <= 0:
             return new_table, -np.inf
 
-        log_alpha = np.log(n_leaf_nodes_after) - np.log(n_split_nodes_before)
+        log_alpha = np.log(n_split_nodes_before) - np.log(max(n_leaf_nodes_after, 1))
 
         return new_table, log_alpha
 
@@ -210,11 +216,16 @@ class ChangeMove(MHDecisionTableMove):
         if node_mask is None or not node_mask.any():
             return new_table, -np.inf
 
-        # Change split variable (with some probability keep the same)
+        # Store old split for validation
+        old_split_var = node.idx_split_variable
+
+        # Change split variable or value (with equal probability)
         if rng.random() < 0.5:
-            new_split_var = node.idx_split_variable
-        else:
+            # Change to different variable
             new_split_var = rng.integers(0, X.shape[1])
+        else:
+            # Keep same variable but new value
+            new_split_var = old_split_var
 
         # Get available split values for new variable
         available_splits = _get_available_splits(X, new_split_var, node_mask)
@@ -227,6 +238,7 @@ class ChangeMove(MHDecisionTableMove):
             return new_table, -np.inf
         split_value = _ensure_split_array(split_value_raw)
 
+        # Validate split (both sides must have data)
         split_rule = table.split_rules[new_split_var]
         division = _split_decision(split_rule, X[:, new_split_var], split_value)
         left_mask = node_mask & division
@@ -235,7 +247,11 @@ class ChangeMove(MHDecisionTableMove):
         if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf
 
-        # Update node + depth predicate
+        # Update split variable and value
+        node.idx_split_variable = new_split_var
+        node.value = split_value.copy()
+
+        # Update depth predicate
         new_table.update_level_predicate(
             depth=depth,
             split_variable=new_split_var,
@@ -250,7 +266,7 @@ class ChangeMove(MHDecisionTableMove):
 
 class MHDecisionTableSampler(ArrayStepShared):
     """
-    Metropolis-Hastings sampler for Decision Tables.
+    Metropolis-Hastings sampler for Decision Tables with ADAPTIVE PARAMETERS.
 
     Parameters
     ----------
@@ -259,9 +275,9 @@ class MHDecisionTableSampler(ArrayStepShared):
     num_tables : int
         Number of decision tables. Defaults to 50
     move_probs : tuple[float, float, float]
-        Probabilities for (grow, prune, change) moves. Defaults to (0.33, 0.33, 0.34)
-    leaf_sd : float
-        Standard deviation for leaf values. Defaults to 1.0
+        Probabilities for (grow, prune, change) moves. Defaults to (0.6, 0.2, 0.2)
+    leaf_sd : float or None
+        Standard deviation for leaf values. If None, auto-estimated from Y. Defaults to None.
     n_jobs : int
         Number of threads to evaluate tables in parallel (>=1). Defaults to 1.
     rng_seed : Optional[int]
@@ -285,8 +301,8 @@ class MHDecisionTableSampler(ArrayStepShared):
         self,
         vars: list[pm.Distribution] | None = None,
         num_tables: int = 50,
-        move_probs: tuple[float, float, float] = (0.33, 0.33, 0.34),
-        leaf_sd: float = 1.0,
+        move_probs: tuple[float, float, float] | None = None,
+        leaf_sd: float | None = None,
         n_jobs: int = 1,
         rng_seed: int | None = None,
         model: Model | None = None,
@@ -341,8 +357,25 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.m = num_tables
         self.num_observations = self.X.shape[0]
         self.num_variates = self.X.shape[1]
-        self.leaf_sd = leaf_sd
+        
+        # ✅ FIX #1: Auto-estimate leaf_sd from Y variance
+        if leaf_sd is None:
+            y_std = np.std(self.Y)
+            self.leaf_sd = max(0.01, y_std * 0.15)
+        else:
+            self.leaf_sd = float(leaf_sd)
+        
+        self.leaf_sd_history = [self.leaf_sd]
+        
+        # ✅ FIX #2: Temperature annealing for convergence
+        self.temperature = 1.0
+        self.temperature_decay = 0.995
+        self.temperature_history = [1.0]
 
+        # ✅ FIX #3: Default move probabilities (grow-heavy)
+        if move_probs is None:
+            move_probs = (0.6, 0.2, 0.2)
+        
         # Normalize move probabilities
         move_probs = np.array(move_probs)
         if np.any(move_probs <= 0):
@@ -383,9 +416,22 @@ class MHDecisionTableSampler(ArrayStepShared):
         super().__init__([value_bart], shared, **kwargs)
 
     def astep(self, _):
-        """Execute one MH step."""
+        """Execute one MH step with adaptive parameters."""
         variable_inclusion = np.zeros(self.num_variates, dtype="int")
         accept_rates: list[float] = []
+
+        # ✅ FIX #4: Adaptive move probabilities based on iteration
+        if self.iteration < 100:
+            # Grow-heavy in early iterations (build structure)
+            current_move_probs = np.array([0.6, 0.2, 0.2])
+        elif self.iteration < 500:
+            # Balanced mid-way
+            current_move_probs = np.array([0.4, 0.3, 0.3])
+        else:
+            # Change-heavy in final iterations (fine-tuning)
+            current_move_probs = np.array([0.2, 0.3, 0.5])
+        
+        current_move_probs = current_move_probs / current_move_probs.sum()
 
         seeds = self.rng.integers(
             low=0,
@@ -394,7 +440,7 @@ class MHDecisionTableSampler(ArrayStepShared):
             dtype=np.int64,
         )
         tasks = [
-            (idx, self.tables[idx], self.table_predictions[idx], int(seeds[idx]))
+            (idx, self.tables[idx], self.table_predictions[idx], int(seeds[idx]), current_move_probs)
             for idx in range(self.m)
         ]
 
@@ -419,11 +465,18 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         self.iteration += sum(1 for res in results if res["count_iteration"])
 
+        # ✅ FIX #5: Adaptive leaf_sd based on residuals
+        ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
+        residuals = self._y_ll - ensemble_pred
+        self._update_leaf_sd_adaptive(residuals)
+
         # Store all tables for posterior inference
         self.all_tables.append([t.trim() for t in self.tables])
 
-        # Compute ensemble predictions
-        ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
+        # ✅ FIX #6: Temperature decay for better convergence
+        self.temperature *= self.temperature_decay
+        self.temperature = max(self.temperature, 0.01)
+        self.temperature_history.append(float(self.temperature))
 
         accept_rate = np.mean(accept_rates) if accept_rates else 0.0
         variable_inclusion_encoded = _encode_vi(variable_inclusion.tolist())
@@ -437,16 +490,36 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         return ensemble_pred, [stats]
 
+    def _update_leaf_sd_adaptive(self, residuals: npt.NDArray) -> None:
+        """Adapt leaf_sd based on prediction residuals."""
+        residual_std = np.std(residuals)
+        
+        # Target: residual std should be ~1.5x leaf_sd
+        target_ratio = 1.5
+        current_ratio = residual_std / (self.leaf_sd + 1e-8)
+        
+        if current_ratio > target_ratio:
+            # Too much error → increase leaf_sd
+            self.leaf_sd *= 1.05
+        elif current_ratio < target_ratio * 0.5:
+            # Too little error → decrease leaf_sd  
+            self.leaf_sd *= 0.95
+        
+        # Keep in reasonable bounds
+        self.leaf_sd = np.clip(self.leaf_sd, 0.001, 100.0)
+        self.leaf_sd_history.append(float(self.leaf_sd))
+
     def _run_single_step(
         self,
         table_idx: int,
         table: DecisionTable,
         current_prediction: npt.NDArray,
         rng_seed: int,
+        move_probs: npt.NDArray,
     ) -> dict:
         """Execute a single MH proposal for one table (optionally in parallel)."""
         rng = np.random.default_rng(rng_seed)
-        move_idx = rng.choice(len(self.moves), p=self.move_probs)
+        move_idx = rng.choice(len(self.moves), p=move_probs)
         move = self.moves[move_idx]
         reverse_idx = self.reverse_move_idx[move_idx]
 
@@ -474,11 +547,11 @@ class MHDecisionTableSampler(ArrayStepShared):
             current_prediction, new_prediction
         )
 
-        log_move_ratio = np.log(self.move_probs[reverse_idx]) - np.log(
-            self.move_probs[move_idx]
-        )
-        log_alpha = log_likelihood_ratio + log_hastings + log_move_ratio
-        accepted = int(np.log(rng.random()) < log_alpha)
+        log_move_ratio = np.log(move_probs[reverse_idx] + 1e-10) - np.log(move_probs[move_idx] + 1e-10)
+        
+        # ✅ FIX #7: Temperature-adjusted acceptance (critical for convergence!)
+        log_alpha = (log_likelihood_ratio + log_hastings + log_move_ratio) / self.temperature
+        accepted = int(np.log(rng.random() + 1e-10) < min(log_alpha, 0.0))
 
         final_table = proposed_table if accepted else table
         final_prediction = new_prediction if accepted else current_prediction
@@ -566,14 +639,32 @@ def _draw_leaf_value(
     leaf_sd: float,
     mask: npt.NDArray | None,
     rng: np.random.Generator,
+    global_mean: float | None = None,
 ) -> npt.NDArray:
-    """Draw a leaf value from normal distribution."""
+    """Draw leaf value with Bayesian regularization for small nodes."""
     if mask is not None and mask.any():
         mask = _normalize_mask(mask, Y.shape[0])
         target = Y[mask]
     else:
         target = Y
-    return np.array([np.mean(target) + rng.normal(0.0, leaf_sd)])
+
+    n_obs = len(target)
+    node_mean = np.mean(target)
+
+    # Regularize small nodes towards global mean
+    if n_obs < 5:
+        if global_mean is None:
+            global_mean = np.mean(Y)
+        # Bayesian shrinkage for small samples
+        weight_node = max(n_obs / 10.0, 0.3)
+        node_mean = weight_node * node_mean + (1.0 - weight_node) * global_mean
+        # More noise for uncertain leaves
+        noise_scale = leaf_sd * (1.0 + 5.0 / max(n_obs, 1.0))
+    else:
+        # Smaller noise for larger nodes (more information)
+        noise_scale = leaf_sd / np.sqrt(max(1.0, n_obs / 50.0))
+
+    return np.array([node_mean + rng.normal(0.0, noise_scale)])
 
 
 def _get_node_mask(
@@ -615,12 +706,19 @@ def _get_node_mask(
 
 
 def _ensure_split_array(value) -> npt.NDArray:
-    """Ensure split values are stored as numpy arrays."""
+    """Ensure split values are stored as 1D numpy arrays."""
     if isinstance(value, np.ndarray):
-        return value.copy()
-    arr = np.array(value, copy=True)
-    if arr.ndim == 0:
-        arr = arr[None]
+        arr = value.copy()
+    else:
+        arr = np.array(value, copy=True)
+    
+    # Normalize to 1D
+    arr = np.atleast_1d(arr)  # Ensure at least 1D
+    arr = np.asarray(arr).ravel()  # Flatten to 1D
+    
+    # Ensure float dtype for numeric operations
+    arr = arr.astype(np.float64)
+    
     return arr
 
 
