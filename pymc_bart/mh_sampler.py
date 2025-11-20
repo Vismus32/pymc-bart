@@ -1,7 +1,10 @@
 """Metropolis-Hastings sampler for Decision Tables."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import numpy.typing as npt
+from numba import njit
 from pymc.step_methods.arraystep import ArrayStepShared
 from pymc.step_methods.compound import Competence
 from pytensor import config
@@ -13,7 +16,7 @@ from pytensor.tensor.variable import Variable
 
 from pymc_bart.bart import BARTRV
 from pymc_bart.decision_table import DecisionTable, DecisionTableNode
-from pymc_bart.split_rules import ContinuousSplitRule
+from pymc_bart.split_rules import ContinuousSplitRule, SplitRule
 from pymc_bart.utils import _encode_vi
 
 
@@ -26,6 +29,7 @@ class MHDecisionTableMove:
         X: npt.NDArray,
         Y: npt.NDArray,
         leaf_sd: float,
+        rng: np.random.Generator,
     ) -> tuple[DecisionTable, float]:
         """
         Propose a new tree structure.
@@ -40,6 +44,8 @@ class MHDecisionTableMove:
             Response variable
         leaf_sd : float
             Standard deviation for leaf values
+        rng : np.random.Generator
+            Random number generator
 
         Returns
         -------
@@ -58,35 +64,48 @@ class GrowMove(MHDecisionTableMove):
         X: npt.NDArray,
         Y: npt.NDArray,
         leaf_sd: float,
+        rng: np.random.Generator,
     ) -> tuple[DecisionTable, float]:
         """Propose growing a random leaf node."""
         new_table = table.copy()
-        leaf_nodes = new_table.get_leaf_nodes()
+        leaf_nodes = new_table.get_leaf_nodes(with_depth=True)
 
         if not leaf_nodes:
             return new_table, -np.inf
 
         # Select random leaf node
-        leaf_idx = np.random.randint(0, len(leaf_nodes))
-        leaf_node = leaf_nodes[leaf_idx]
+        leaf_idx = rng.integers(0, len(leaf_nodes))
+        leaf_node, depth = leaf_nodes[leaf_idx]
 
-        # Select random split variable
-        split_var = np.random.randint(0, X.shape[1])
-
-        # Get available split values
-        available_splits = _get_available_splits(X, split_var)
-        if available_splits.size == 0:
+        node_mask = _get_node_mask(new_table, leaf_node, X)
+        if node_mask is None or not np.any(node_mask):
             return new_table, -np.inf
 
-        # Select random split value
-        split_value = table.split_rules[split_var].get_split_value(available_splits)
-        if split_value is None:
+        split_var, split_value = new_table.get_level_predicate(depth)
+        if split_var is None or split_value is None:
+            split_var = rng.integers(0, X.shape[1])
+            available_splits = _get_available_splits(X, split_var, node_mask)
+            if available_splits.size == 0:
+                return new_table, -np.inf
+
+            split_value_raw = table.split_rules[split_var].get_split_value(available_splits)
+            if split_value_raw is None:
+                return new_table, -np.inf
+            split_value = _ensure_split_array(split_value_raw)
+        else:
+            split_value = split_value.copy()
+
+        split_rule = table.split_rules[split_var]
+        division = _split_decision(split_rule, X[:, split_var], split_value)
+
+        left_mask = node_mask & division
+        right_mask = node_mask & (~division)
+
+        if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf
 
-        # Compute new leaf values
-        to_left = table.split_rules[split_var].divide(available_splits, split_value).astype(bool)
-        left_value = _draw_leaf_value(Y, leaf_sd)
-        right_value = _draw_leaf_value(Y, leaf_sd)
+        left_value = _draw_leaf_value(Y, leaf_sd, left_mask, rng)
+        right_value = _draw_leaf_value(Y, leaf_sd, right_mask, rng)
 
         # Grow the leaf
         new_table.grow_leaf_node(
@@ -95,13 +114,14 @@ class GrowMove(MHDecisionTableMove):
             split_value=np.array([split_value]),
             left_value=left_value,
             right_value=right_value,
-            left_nvalue=np.sum(to_left),
-            right_nvalue=np.sum(~to_left),
+            left_nvalue=int(left_mask.sum()),
+            right_nvalue=int(right_mask.sum()),
+            depth=depth,
         )
 
         # Compute Hastings ratio
         n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = len(new_table.get_leaf_nodes()) - 1
+        n_split_nodes = new_table.count_split_nodes()
 
         log_alpha = np.log(max(n_split_nodes, 1)) - np.log(n_leaf_nodes)
 
@@ -117,42 +137,47 @@ class PruneMove(MHDecisionTableMove):
         X: npt.NDArray,
         Y: npt.NDArray,
         leaf_sd: float,
+        rng: np.random.Generator,
     ) -> tuple[DecisionTable, float]:
         """Propose pruning a random split node."""
         new_table = table.copy()
 
         # Get all split nodes
-        split_nodes = [
-            node
-            for node in _get_all_nodes(new_table.root)
-            if node.is_split_node()
-        ]
+        split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
             return new_table, -np.inf
 
+        n_split_nodes_before = len(split_nodes)
+
         # Select random split node
-        split_idx = np.random.randint(0, len(split_nodes))
-        node_to_prune = split_nodes[split_idx]
+        split_idx = rng.integers(0, len(split_nodes))
+        node_to_prune, _ = split_nodes[split_idx]
 
         # Check if both children are leaves
         if not all(child.is_leaf_node() for child in node_to_prune.children.values()):
             return new_table, -np.inf
 
+        node_mask = _get_node_mask(new_table, node_to_prune, X)
+        if node_mask is None or not node_mask.any():
+            return new_table, -np.inf
+
         # Draw new leaf value
-        new_leaf_value = _draw_leaf_value(Y, leaf_sd)
+        new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask, rng)
 
         # Prune: convert split node to leaf
-        node_to_prune.idx_split_variable = -1
-        node_to_prune.value = new_leaf_value
-        node_to_prune.children = {}
+        new_table.prune_node(
+            node=node_to_prune,
+            new_value=new_leaf_value,
+            nvalue=int(node_mask.sum()),
+        )
 
-        # Compute Hastings ratio
-        leaf_nodes = new_table.get_leaf_nodes()
-        n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = len(split_nodes) - 1
+        # Compute Hastings ratio (reverse grow selects among new leaves)
+        n_leaf_nodes_after = new_table.count_leaf_nodes()
+        if n_leaf_nodes_after <= 0 or n_split_nodes_before <= 0:
+            return new_table, -np.inf
 
-        log_alpha = np.log(n_leaf_nodes) - np.log(max(n_split_nodes, 1))
+        log_alpha = np.log(n_leaf_nodes_after) - np.log(n_split_nodes_before)
 
         return new_table, log_alpha
 
@@ -166,43 +191,56 @@ class ChangeMove(MHDecisionTableMove):
         X: npt.NDArray,
         Y: npt.NDArray,
         leaf_sd: float,
+        rng: np.random.Generator,
     ) -> tuple[DecisionTable, float]:
         """Propose changing a split variable or split value."""
         new_table = table.copy()
 
         # Get all split nodes
-        split_nodes = [
-            node
-            for node in _get_all_nodes(new_table.root)
-            if node.is_split_node()
-        ]
+        split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
             return new_table, -np.inf
 
         # Select random split node
-        split_idx = np.random.randint(0, len(split_nodes))
-        node = split_nodes[split_idx]
+        split_idx = rng.integers(0, len(split_nodes))
+        node, depth = split_nodes[split_idx]
+
+        node_mask = _get_node_mask(new_table, node, X)
+        if node_mask is None or not node_mask.any():
+            return new_table, -np.inf
 
         # Change split variable (with some probability keep the same)
-        if np.random.random() < 0.5:
+        if rng.random() < 0.5:
             new_split_var = node.idx_split_variable
         else:
-            new_split_var = np.random.randint(0, X.shape[1])
+            new_split_var = rng.integers(0, X.shape[1])
 
         # Get available split values for new variable
-        available_splits = _get_available_splits(X, new_split_var)
+        available_splits = _get_available_splits(X, new_split_var, node_mask)
         if available_splits.size == 0:
             return new_table, -np.inf
 
         # Select split value
-        split_value = table.split_rules[new_split_var].get_split_value(available_splits)
-        if split_value is None:
+        split_value_raw = table.split_rules[new_split_var].get_split_value(available_splits)
+        if split_value_raw is None:
+            return new_table, -np.inf
+        split_value = _ensure_split_array(split_value_raw)
+
+        split_rule = table.split_rules[new_split_var]
+        division = _split_decision(split_rule, X[:, new_split_var], split_value)
+        left_mask = node_mask & division
+        right_mask = node_mask & (~division)
+
+        if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf
 
-        # Update node
-        node.idx_split_variable = new_split_var
-        node.value = np.array([split_value])
+        # Update node + depth predicate
+        new_table.update_level_predicate(
+            depth=depth,
+            split_variable=new_split_var,
+            split_value=split_value,
+        )
 
         # Hastings ratio = 1 (symmetric proposal)
         log_alpha = 0.0
@@ -224,6 +262,10 @@ class MHDecisionTableSampler(ArrayStepShared):
         Probabilities for (grow, prune, change) moves. Defaults to (0.33, 0.33, 0.34)
     leaf_sd : float
         Standard deviation for leaf values. Defaults to 1.0
+    n_jobs : int
+        Number of threads to evaluate tables in parallel (>=1). Defaults to 1.
+    rng_seed : Optional[int]
+        Seed used to initialize the sampler RNG. Defaults to None.
     model : PyMC Model
         Optional model for sampling step. Defaults to None (taken from context).
     initial_point : Optional dict
@@ -245,6 +287,8 @@ class MHDecisionTableSampler(ArrayStepShared):
         num_tables: int = 50,
         move_probs: tuple[float, float, float] = (0.33, 0.33, 0.34),
         leaf_sd: float = 1.0,
+        n_jobs: int = 1,
+        rng_seed: int | None = None,
         model: Model | None = None,
         initial_point: dict | None = None,
         **kwargs,
@@ -291,6 +335,9 @@ class MHDecisionTableSampler(ArrayStepShared):
         else:
             self.Y = self.bart.Y
 
+        self.X = np.asarray(self.X, dtype=config.floatX)
+        self.Y = np.asarray(self.Y, dtype=config.floatX)
+
         self.m = num_tables
         self.num_observations = self.X.shape[0]
         self.num_variates = self.X.shape[1]
@@ -298,11 +345,16 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         # Normalize move probabilities
         move_probs = np.array(move_probs)
+        if np.any(move_probs <= 0):
+            raise ValueError("move_probs must all be positive.")
         self.move_probs = move_probs / move_probs.sum()
 
         # Initialize move operators
         self.moves = [GrowMove(), PruneMove(), ChangeMove()]
         self.move_names = ["grow", "prune", "change"]
+        self.reverse_move_idx = [1, 0, 2]
+        self.rng = np.random.default_rng(rng_seed)
+        self.n_jobs = max(1, int(n_jobs))
 
         # Initialize decision tables
         self.tables = [
@@ -317,6 +369,9 @@ class MHDecisionTableSampler(ArrayStepShared):
             for _ in range(self.m)
         ]
 
+        self.table_predictions = [t.predict(self.X) for t in self.tables]
+        self._y_ll = self.Y.astype(np.float64, copy=False).ravel()
+
         self.all_tables = [[t.trim() for t in self.tables]]
         self.accept_count = 0
         self.iteration = 0
@@ -330,63 +385,114 @@ class MHDecisionTableSampler(ArrayStepShared):
     def astep(self, _):
         """Execute one MH step."""
         variable_inclusion = np.zeros(self.num_variates, dtype="int")
-        accept_rates = []
-        move_idx = 0
+        accept_rates: list[float] = []
 
-        for table_idx in range(self.m):
-            # Select move type
-            move_idx = np.random.choice(len(self.moves), p=self.move_probs)
-            move = self.moves[move_idx]
+        seeds = self.rng.integers(
+            low=0,
+            high=np.iinfo(np.int64).max,
+            size=self.m,
+            dtype=np.int64,
+        )
+        tasks = [
+            (idx, self.tables[idx], self.table_predictions[idx], int(seeds[idx]))
+            for idx in range(self.m)
+        ]
 
-            # Propose new table
-            proposed_table, log_hastings = move.propose(
-                self.tables[table_idx], self.X, self.Y, self.leaf_sd
-            )
+        if self.n_jobs == 1:
+            results = [self._run_single_step(*task) for task in tasks]
+        else:
+            with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                futures = [executor.submit(self._run_single_step, *task) for task in tasks]
+                results = [future.result() for future in futures]
 
-            if log_hastings == -np.inf:
-                accept_rates.append(0.0)
-                continue
+        results.sort(key=lambda res: res["idx"])
 
-            # Compute log likelihood ratio
-            old_pred = self.tables[table_idx].predict(self.X)
-            new_pred = proposed_table.predict(self.X)
+        for result in results:
+            idx = result["idx"]
+            self.tables[idx] = result["table"]
+            self.table_predictions[idx] = result["prediction"]
+            self.accept_count += int(result["accepted"])
+            accept_rates.append(float(result["accepted"]))
+            if result["count_iteration"]:
+                for var in result["split_vars"]:
+                    variable_inclusion[var] += 1
 
-            log_likelihood_ratio = self._compute_log_likelihood_ratio(old_pred, new_pred)
-
-            # Acceptance probability
-            log_alpha = log_likelihood_ratio + log_hastings
-            if np.log(np.random.random()) < log_alpha:
-                self.tables[table_idx] = proposed_table
-                self.accept_count += 1
-                accept_rates.append(1.0)
-            else:
-                accept_rates.append(0.0)
-
-            self.iteration += 1
-
-            # Track variable inclusion
-            split_vars = self._get_split_variables(self.tables[table_idx])
-            for var in split_vars:
-                variable_inclusion[var] += 1
+        self.iteration += sum(1 for res in results if res["count_iteration"])
 
         # Store all tables for posterior inference
         self.all_tables.append([t.trim() for t in self.tables])
 
         # Compute ensemble predictions
-        ensemble_pred = np.mean(
-            np.array([t.predict(self.X) for t in self.tables]), axis=0
-        )
+        ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
 
         accept_rate = np.mean(accept_rates) if accept_rates else 0.0
         variable_inclusion_encoded = _encode_vi(variable_inclusion.tolist())
+        last_move_idx = results[-1]["move_idx"] if results else 0
 
         stats = {
             "variable_inclusion": variable_inclusion_encoded,
-            "move_type": self.move_names[move_idx],
+            "move_type": self.move_names[last_move_idx],
             "accept_rate": accept_rate,
         }
 
         return ensemble_pred, [stats]
+
+    def _run_single_step(
+        self,
+        table_idx: int,
+        table: DecisionTable,
+        current_prediction: npt.NDArray,
+        rng_seed: int,
+    ) -> dict:
+        """Execute a single MH proposal for one table (optionally in parallel)."""
+        rng = np.random.default_rng(rng_seed)
+        move_idx = rng.choice(len(self.moves), p=self.move_probs)
+        move = self.moves[move_idx]
+        reverse_idx = self.reverse_move_idx[move_idx]
+
+        proposed_table, log_hastings = move.propose(
+            table,
+            self.X,
+            self.Y,
+            self.leaf_sd,
+            rng,
+        )
+
+        if log_hastings == -np.inf:
+            return {
+                "idx": table_idx,
+                "table": table,
+                "prediction": current_prediction,
+                "accepted": 0,
+                "move_idx": move_idx,
+                "split_vars": [],
+                "count_iteration": False,
+            }
+
+        new_prediction = proposed_table.predict(self.X)
+        log_likelihood_ratio = self._compute_log_likelihood_ratio(
+            current_prediction, new_prediction
+        )
+
+        log_move_ratio = np.log(self.move_probs[reverse_idx]) - np.log(
+            self.move_probs[move_idx]
+        )
+        log_alpha = log_likelihood_ratio + log_hastings + log_move_ratio
+        accepted = int(np.log(rng.random()) < log_alpha)
+
+        final_table = proposed_table if accepted else table
+        final_prediction = new_prediction if accepted else current_prediction
+        split_vars = self._get_split_variables(final_table)
+
+        return {
+            "idx": table_idx,
+            "table": final_table,
+            "prediction": final_prediction,
+            "accepted": accepted,
+            "move_idx": move_idx,
+            "split_vars": split_vars,
+            "count_iteration": True,
+        }
 
     def _compute_log_likelihood_ratio(
         self,
@@ -394,15 +500,20 @@ class MHDecisionTableSampler(ArrayStepShared):
         new_pred: npt.NDArray,
     ) -> float:
         """Compute log likelihood ratio for MH acceptance."""
-        residuals_old = self.Y - old_pred
-        residuals_new = self.Y - new_pred
+        old_flat = np.asarray(old_pred, dtype=np.float64).ravel()
+        new_flat = np.asarray(new_pred, dtype=np.float64).ravel()
 
-        sse_old = np.sum(residuals_old**2)
-        sse_new = np.sum(residuals_new**2)
+        if old_flat.shape[0] != self._y_ll.shape[0] or new_flat.shape[0] != self._y_ll.shape[0]:
+            raise ValueError(
+                "Predictions and observations must share the same flattened size."
+            )
 
-        log_lik_ratio = 0.5 * (sse_old - sse_new) / (self.leaf_sd**2)
-
-        return log_lik_ratio
+        return _log_likelihood_ratio_numba(
+            self._y_ll,
+            old_flat,
+            new_flat,
+            float(self.leaf_sd),
+        )
 
     def _get_split_variables(self, table: DecisionTable) -> list[int]:
         """Get all split variables used in the table."""
@@ -436,20 +547,118 @@ class MHDecisionTableSampler(ArrayStepShared):
         return (update_stats,)
 
 
-def _get_available_splits(X: npt.NDArray, var_idx: int) -> npt.NDArray:
+def _get_available_splits(
+    X: npt.NDArray, var_idx: int, mask: npt.NDArray | None = None
+) -> npt.NDArray:
     """Get available split values for a variable."""
     values = X[:, var_idx]
-    return values[~np.isnan(values)]
+    if mask is not None:
+        mask = _normalize_mask(mask, values.shape[0])
+        values = values[mask]
+    values = values[~np.isnan(values)]
+    if values.size == 0:
+        return values
+    return np.unique(values)
 
 
-def _draw_leaf_value(Y: npt.NDArray, leaf_sd: float) -> npt.NDArray:
+def _draw_leaf_value(
+    Y: npt.NDArray,
+    leaf_sd: float,
+    mask: npt.NDArray | None,
+    rng: np.random.Generator,
+) -> npt.NDArray:
     """Draw a leaf value from normal distribution."""
-    return np.array([np.mean(Y) + np.random.normal(0, leaf_sd)])
+    if mask is not None and mask.any():
+        mask = _normalize_mask(mask, Y.shape[0])
+        target = Y[mask]
+    else:
+        target = Y
+    return np.array([np.mean(target) + rng.normal(0.0, leaf_sd)])
 
 
-def _get_all_nodes(node: DecisionTableNode) -> list[DecisionTableNode]:
-    """Get all nodes in the tree."""
-    nodes = [node]
-    for child in node.children.values():
-        nodes.extend(_get_all_nodes(child))
-    return nodes
+def _get_node_mask(
+    table: DecisionTable, target_node: DecisionTableNode, X: npt.NDArray
+) -> npt.NDArray | None:
+    """Return boolean mask of observations reaching the provided node."""
+    split_rules = table.split_rules
+    n_obs = X.shape[0]
+
+    def _traverse(node: DecisionTableNode, mask: npt.NDArray) -> npt.NDArray | None:
+        mask = _normalize_mask(mask, n_obs)
+        if node is target_node:
+            return mask
+        if node.is_leaf_node():
+            return None
+
+        split_var = node.idx_split_variable
+        split_value = node.value
+        division = _split_decision(split_rules[split_var], X[:, split_var], split_value)
+
+        left_mask = mask & division
+        right_mask = mask & (~division)
+
+        if 0 in node.children:
+            result = _traverse(node.children[0], left_mask)
+            if result is not None:
+                return result
+        if 1 in node.children:
+            result = _traverse(node.children[1], right_mask)
+            if result is not None:
+                return result
+        return None
+
+    full_mask = np.ones(n_obs, dtype=bool)
+    result = _traverse(table.root, full_mask)
+    if result is None:
+        return None
+    return _normalize_mask(result, n_obs)
+
+
+def _ensure_split_array(value) -> npt.NDArray:
+    """Ensure split values are stored as numpy arrays."""
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    arr = np.array(value, copy=True)
+    if arr.ndim == 0:
+        arr = arr[None]
+    return arr
+
+
+def _normalize_mask(mask: npt.NDArray, length: int) -> npt.NDArray:
+    """Ensure mask is 1-D boolean array of requested length."""
+    mask_arr = np.asarray(mask, dtype=bool)
+    mask_arr = np.squeeze(mask_arr)
+    mask_arr = mask_arr.reshape(-1)
+    if mask_arr.size != length:
+        raise ValueError(
+            f"Mask has size {mask_arr.size}, expected {length}. "
+            "Split rule produced incompatible shape."
+        )
+    return mask_arr
+
+
+def _split_decision(
+    split_rule: SplitRule, feature_values: npt.NDArray, split_value: npt.NDArray
+) -> npt.NDArray:
+    """Evaluate split rule and normalize mask shape."""
+    division = split_rule.divide(feature_values, split_value)
+    return _normalize_mask(division, feature_values.shape[0])
+
+
+@njit(cache=True, fastmath=True)
+def _log_likelihood_ratio_numba(
+    y: np.ndarray,
+    old_pred: np.ndarray,
+    new_pred: np.ndarray,
+    leaf_sd: float,
+) -> float:
+    """Numba-accelerated log-likelihood ratio."""
+    inv_var = 1.0 / (leaf_sd * leaf_sd)
+    sse_old = 0.0
+    sse_new = 0.0
+    for i in range(y.size):
+        diff_old = y[i] - old_pred[i]
+        diff_new = y[i] - new_pred[i]
+        sse_old += diff_old * diff_old
+        sse_new += diff_new * diff_new
+    return 0.5 * (sse_old - sse_new) * inv_var
